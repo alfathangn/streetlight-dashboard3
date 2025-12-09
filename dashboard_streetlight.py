@@ -1,50 +1,20 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import json
 import time
-import queue
-import threading
-from datetime import datetime, timedelta
-import plotly.graph_objs as go
-import plotly.express as px
 import paho.mqtt.client as mqtt
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+import plotly.express as px
 import socket
 
-# ==================== KONFIGURASI ====================
+# ==================== KONFIGURASI MQTT ====================
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
 MQTT_TOPIC_SENSOR = "iot/streetlight"
 MQTT_TOPIC_CONTROL = "iot/streetlight/control"
 
-# UI constants
-MAX_POINTS = 200
-
-# ==================== GLOBAL QUEUE ====================
-GLOBAL_MQ = queue.Queue()
-
-# ==================== STREAMLIT PAGE SETUP ====================
-st.set_page_config(
-    page_title="Smart Streetlight Dashboard",
-    page_icon="💡",
-    layout="wide"
-)
-
-st.title("💡 SMART STREETLIGHT MONITORING SYSTEM")
-
 # ==================== SESSION STATE INIT ====================
-if "msg_queue" not in st.session_state:
-    st.session_state.msg_queue = GLOBAL_MQ
-
-if "logs" not in st.session_state:
-    st.session_state.logs = []
-
-if "last_data" not in st.session_state:
-    st.session_state.last_data = None
-
-if "mqtt_thread_started" not in st.session_state:
-    st.session_state.mqtt_thread_started = False
-
 if "mqtt_connected" not in st.session_state:
     st.session_state.mqtt_connected = False
 
@@ -54,11 +24,20 @@ if "connection_status" not in st.session_state:
 if "connection_error" not in st.session_state:
     st.session_state.connection_error = ""
 
-if "manual_connect_clicked" not in st.session_state:
-    st.session_state.manual_connect_clicked = False
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+
+if "last_data" not in st.session_state:
+    st.session_state.last_data = None
+
+if "mqtt_client" not in st.session_state:
+    st.session_state.mqtt_client = None
 
 if "broker_test_result" not in st.session_state:
     st.session_state.broker_test_result = None
+
+if "last_connection_attempt" not in st.session_state:
+    st.session_state.last_connection_attempt = "Belum pernah"
 
 # ==================== FUNGSI TEST KONEKSI ====================
 def test_broker_connection():
@@ -73,17 +52,17 @@ def test_broker_connection():
         return False, str(e)
 
 # ==================== MQTT CALLBACKS ====================
-def _on_connect(client, userdata, flags, rc):
+def on_connect(client, userdata, flags, rc, properties=None):
     """Callback ketika koneksi MQTT berhasil/gagal"""
     if rc == 0:
+        st.session_state.mqtt_connected = True
+        st.session_state.connection_status = "✅ TERKONEKSI"
+        st.session_state.connection_error = ""
         client.subscribe(MQTT_TOPIC_SENSOR)
-        GLOBAL_MQ.put({
-            "_type": "status", 
-            "connected": True, 
-            "message": f"✅ Terhubung ke broker",
-            "ts": time.time()
-        })
+        print(f"✅ Connected to MQTT broker")
+        print(f"✅ Subscribed to topic: {MQTT_TOPIC_SENSOR}")
     else:
+        st.session_state.mqtt_connected = False
         error_messages = {
             1: "Incorrect protocol version",
             2: "Invalid client identifier",
@@ -92,21 +71,25 @@ def _on_connect(client, userdata, flags, rc):
             5: "Not authorized"
         }
         error_msg = error_messages.get(rc, f"Error code: {rc}")
-        GLOBAL_MQ.put({
-            "_type": "status",
-            "connected": False,
-            "message": f"❌ Koneksi gagal: {error_msg}",
-            "ts": time.time()
-        })
+        st.session_state.connection_status = f"❌ {error_msg}"
+        st.session_state.connection_error = error_msg
+        print(f"❌ Connection failed: {error_msg}")
 
-def _on_message(client, userdata, msg):
+def on_disconnect(client, userdata, rc):
+    """Callback ketika terputus dari MQTT"""
+    st.session_state.mqtt_connected = False
+    st.session_state.connection_status = "❌ TERPUTUS"
+    print(f"⚠️ Disconnected from MQTT broker")
+
+def on_message(client, userdata, msg):
     """Callback ketika menerima pesan MQTT"""
     try:
         payload = msg.payload.decode('utf-8', errors='ignore')
+        print(f"📥 Received MQTT message: {payload}")
         
         # Parse data dari ESP32 (format: {timestamp;intensity;voltage})
         if payload.startswith("{") and payload.endswith("}"):
-            clean_payload = payload[1:-1]
+            clean_payload = payload[1:-1]  # Remove curly braces
             parts = clean_payload.split(";")
             
             if len(parts) == 3:
@@ -131,7 +114,7 @@ def _on_message(client, userdata, msg):
                 except:
                     timestamp = datetime.now()
                 
-                # Determine states
+                # Determine states berdasarkan logika ESP32
                 if voltage == 0.0:
                     relay_state = "MATI"
                     lamp_state = "MENYALA"
@@ -142,205 +125,78 @@ def _on_message(client, userdata, msg):
                     relay_state = "UNKNOWN"
                     lamp_state = "UNKNOWN"
                 
-                # Push to queue
-                GLOBAL_MQ.put({
-                    "_type": "sensor",
-                    "data": {
-                        "timestamp": timestamp,
-                        "intensity": intensity,
-                        "voltage": voltage,
-                        "relay_state": relay_state,
-                        "lamp_state": lamp_state
-                    },
-                    "ts": time.time()
-                })
-                
-    except Exception as e:
-        GLOBAL_MQ.put({
-            "_type": "error",
-            "message": f"Error parsing MQTT message: {str(e)}",
-            "ts": time.time()
-        })
-
-def _on_disconnect(client, userdata, rc):
-    """Callback ketika terputus dari MQTT"""
-    GLOBAL_MQ.put({
-        "_type": "status",
-        "connected": False,
-        "message": f"⚠️ Terputus dari broker (rc={rc})",
-        "ts": time.time()
-    })
-
-# ==================== MQTT WORKER THREAD ====================
-def start_mqtt_worker():
-    """Start MQTT worker thread"""
-    def worker():
-        client = None
-        while True:
-            try:
-                # Create new client
-                client_id = f"streetlight-dashboard-{int(time.time())}"
-                client = mqtt.Client(client_id=client_id)
-                client.on_connect = _on_connect
-                client.on_message = _on_message
-                client.on_disconnect = _on_disconnect
-                
-                # Connect
-                client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-                
-                # Start loop
-                client.loop_forever()
-                
-            except Exception as e:
-                error_msg = f"❌ Connection error: {str(e)}"
-                GLOBAL_MQ.put({
-                    "_type": "error",
-                    "message": error_msg,
-                    "ts": time.time()
-                })
-                
-                # Cleanup
-                if client:
-                    try:
-                        client.loop_stop()
-                        client.disconnect()
-                    except:
-                        pass
-                
-                # Wait before retry
-                time.sleep(5)
-    
-    if not st.session_state.mqtt_thread_started:
-        t = threading.Thread(target=worker, daemon=True, name="mqtt_worker")
-        t.start()
-        st.session_state.mqtt_thread_started = True
-        return True
-    return False
-
-# ==================== PROCESS QUEUE ====================
-def process_queue():
-    """Process incoming messages from MQTT queue"""
-    updated = False
-    q = st.session_state.msg_queue
-    
-    while not q.empty():
-        try:
-            item = q.get_nowait()
-            item_type = item.get("_type")
-            
-            if item_type == "status":
-                # Update connection status
-                st.session_state.mqtt_connected = item.get("connected", False)
-                st.session_state.connection_status = item.get("message", "")
-                updated = True
-                
-            elif item_type == "error":
-                # Show error message
-                st.session_state.connection_error = item.get("message", "")
-                updated = True
-                
-            elif item_type == "sensor":
-                # Process sensor data
-                data = item.get("data", {})
-                
+                # Create data row
                 row = {
-                    "timestamp": data.get("timestamp", datetime.now()),
-                    "intensity": data.get("intensity"),
-                    "voltage": data.get("voltage"),
-                    "relay_state": data.get("relay_state"),
-                    "lamp_state": data.get("lamp_state"),
+                    "timestamp": timestamp,
+                    "intensity": intensity,
+                    "voltage": voltage,
+                    "relay_state": relay_state,
+                    "lamp_state": lamp_state,
                     "source": "MQTT REAL"
                 }
                 
-                # Add to logs
-                st.session_state.logs.append(row)
+                # Update session state
                 st.session_state.last_data = row
+                st.session_state.logs.append(row)
                 
                 # Keep logs bounded
-                if len(st.session_state.logs) > 5000:
-                    st.session_state.logs = st.session_state.logs[-5000:]
+                if len(st.session_state.logs) > 1000:
+                    st.session_state.logs = st.session_state.logs[-1000:]
                 
-                updated = True
+                print(f"✅ Parsed: Intensity={intensity}, Voltage={voltage}, Relay={relay_state}")
                 
-        except queue.Empty:
-            break
-        except Exception as e:
-            st.error(f"Error processing queue: {str(e)}")
-    
-    return updated
+    except Exception as e:
+        print(f"❌ Error processing MQTT message: {e}")
 
-# ==================== FUNGSI UTILITAS ====================
-def calculate_statistics():
-    """Calculate statistics from logs"""
-    if not st.session_state.logs:
-        return {
-            "avg_intensity": 0,
-            "avg_voltage": 0,
-            "lamp_on_percentage": 0,
-            "total_data": 0,
-            "latest_timestamp": "N/A"
-        }
-    
-    df = pd.DataFrame(st.session_state.logs)
-    
-    if df.empty:
-        return {
-            "avg_intensity": 0,
-            "avg_voltage": 0,
-            "lamp_on_percentage": 0,
-            "total_data": 0,
-            "latest_timestamp": "N/A"
-        }
-    
-    # Basic stats
-    avg_intensity = df["intensity"].mean() if "intensity" in df.columns and not df["intensity"].isna().all() else 0
-    avg_voltage = df["voltage"].mean() if "voltage" in df.columns and not df["voltage"].isna().all() else 0
-    
-    # Lamp on percentage
-    if "lamp_state" in df.columns:
-        lamp_on_count = (df["lamp_state"] == "MENYALA").sum()
-        lamp_on_percentage = (lamp_on_count / len(df)) * 100 if len(df) > 0 else 0
-    else:
-        lamp_on_percentage = 0
-    
-    # Latest timestamp
-    latest_timestamp = df["timestamp"].max() if "timestamp" in df.columns else "N/A"
-    if isinstance(latest_timestamp, datetime):
-        latest_timestamp = latest_timestamp.strftime("%H:%M:%S")
-    
-    return {
-        "avg_intensity": round(avg_intensity, 1),
-        "avg_voltage": round(avg_voltage, 1),
-        "lamp_on_percentage": round(lamp_on_percentage, 1),
-        "total_data": len(df),
-        "latest_timestamp": latest_timestamp
-    }
+# ==================== FUNGSI KONEKSI MQTT ====================
+def connect_mqtt():
+    """Connect to MQTT broker"""
+    try:
+        # Test broker connection first
+        success, error = test_broker_connection()
+        if not success:
+            st.session_state.connection_status = f"❌ Broker tidak dapat diakses: {error}"
+            st.session_state.connection_error = error
+            return False
+        
+        # Create MQTT client
+        client = mqtt.Client()
+        client.on_connect = on_connect
+        client.on_message = on_message
+        client.on_disconnect = on_disconnect
+        
+        # Connect
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        st.session_state.mqtt_client = client
+        st.session_state.last_connection_attempt = datetime.now().strftime("%H:%M:%S")
+        
+        return True
+        
+    except Exception as e:
+        st.session_state.connection_status = f"❌ Connection error: {str(e)}"
+        st.session_state.connection_error = str(e)
+        print(f"❌ Connection failed: {e}")
+        return False
 
-def create_intensity_gauge(value):
-    """Create gauge chart for light intensity"""
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=value,
-        title={"text": "INTENSITAS CAHAYA", "font": {"size": 16}},
-        domain={"x": [0, 1], "y": [0, 1]},
-        gauge={
-            "axis": {"range": [0, 100]},
-            "bar": {"color": "#FFA500"},
-            "steps": [
-                {"range": [0, 30], "color": "#4CAF50", "name": "Gelap"},
-                {"range": [30, 70], "color": "#FFC107", "name": "Sedang"},
-                {"range": [70, 100], "color": "#2196F3", "name": "Terang"}
-            ],
-            "threshold": {
-                "line": {"color": "red", "width": 4},
-                "thickness": 0.75,
-                "value": 50
-            }
-        }
-    ))
-    
-    fig.update_layout(height=250, margin=dict(t=50, b=50, l=50, r=50))
-    return fig
+def disconnect_mqtt():
+    """Disconnect from MQTT broker"""
+    if st.session_state.mqtt_client:
+        try:
+            st.session_state.mqtt_client.disconnect()
+        except:
+            pass
+    st.session_state.mqtt_connected = False
+    st.session_state.connection_status = "❌ TIDAK TERKONEKSI"
+    st.session_state.mqtt_client = None
+
+# ==================== STREAMLIT UI ====================
+st.set_page_config(
+    page_title="Smart Streetlight Dashboard",
+    page_icon="💡",
+    layout="wide"
+)
+
+st.title("💡 SMART STREETLIGHT MONITORING SYSTEM")
 
 # ==================== SIDEBAR ====================
 with st.sidebar:
@@ -361,33 +217,41 @@ with st.sidebar:
         if st.session_state.connection_error:
             st.error(st.session_state.connection_error)
     
+    st.write(f"**Terakhir dicoba:** {st.session_state.last_connection_attempt}")
+    
     # Connection Buttons
     st.markdown("---")
     st.subheader("🔄 KONTROL MQTT")
     
-    col_connect, col_test = st.columns(2)
+    # Connect Button
+    if st.button("🔗 Sambungkan ke MQTT", use_container_width=True, type="primary"):
+        with st.spinner("Menghubungkan ke MQTT broker..."):
+            if connect_mqtt():
+                st.success("✅ Berhasil menghubungkan ke broker")
+                st.session_state.broker_test_result = "✅ SUCCESS"
+            else:
+                st.error("❌ Gagal menghubungkan ke broker")
+                st.session_state.broker_test_result = "❌ FAILED"
+        time.sleep(1)
+        st.rerun()
     
-    with col_connect:
-        if st.button("🔗 Sambungkan", use_container_width=True, type="primary"):
-            st.session_state.manual_connect_clicked = True
-            with st.spinner("Menghubungkan ke MQTT broker..."):
-                if start_mqtt_worker():
-                    st.success("MQTT worker dimulai")
-                else:
-                    st.info("MQTT worker sudah berjalan")
-            time.sleep(1)
-            st.rerun()
+    # Disconnect Button
+    if st.button("🔌 Putuskan Koneksi", use_container_width=True):
+        disconnect_mqtt()
+        st.warning("Koneksi MQTT diputuskan")
+        time.sleep(1)
+        st.rerun()
     
-    with col_test:
-        if st.button("🧪 Test Broker", use_container_width=True):
-            with st.spinner("Testing koneksi ke broker..."):
-                success, error = test_broker_connection()
-                if success:
-                    st.success("✅ Broker dapat diakses")
-                    st.session_state.broker_test_result = "✅ SUCCESS"
-                else:
-                    st.error(f"❌ Broker tidak dapat diakses: {error}")
-                    st.session_state.broker_test_result = "❌ FAILED"
+    # Test Connection Button
+    if st.button("🧪 Test Koneksi Broker", use_container_width=True):
+        with st.spinner("Testing koneksi ke broker..."):
+            success, error = test_broker_connection()
+            if success:
+                st.success("✅ Broker dapat diakses dari server ini")
+                st.session_state.broker_test_result = "✅ SUCCESS"
+            else:
+                st.error(f"❌ Broker tidak dapat diakses: {error}")
+                st.session_state.broker_test_result = "❌ FAILED"
     
     # Data Control
     st.markdown("---")
@@ -425,15 +289,22 @@ const char* topic = "{MQTT_TOPIC_SENSOR}";
     with st.expander("Troubleshooting"):
         st.markdown("""
         **Jika tidak ada data:**
-        1. Buka Serial Monitor ESP32 (115200 baud)
-        2. Cek pesan "✓ WiFi connected!"
-        3. Cek pesan "✓ MQTT connected!"
-        4. Cek pesan "📤 MQTT Sent: {...}"
-        5. Test di MQTT client online
+        1. ✅ Buka Serial Monitor ESP32 (115200 baud)
+        2. ✅ Cek pesan "✓ WiFi connected!"
+        3. ✅ Cek pesan "✓ MQTT connected!"
+        4. ✅ Cek pesan "📤 MQTT Sent: {...}"
+        5. ✅ Test di: http://www.hivemq.com/demos/websocket-client/
+           - Connect to: broker.hivemq.com:1883
+           - Subscribe to: iot/streetlight
         """)
 
-# ==================== PROCESS QUEUE ====================
-process_queue()
+# ==================== MQTT LOOP POLLING ====================
+# Process MQTT messages if connected
+if st.session_state.mqtt_client:
+    try:
+        st.session_state.mqtt_client.loop(timeout=0.1)
+    except Exception as e:
+        print(f"MQTT loop error: {e}")
 
 # ==================== MAIN DASHBOARD ====================
 # Status Banner
@@ -441,7 +312,7 @@ if not st.session_state.mqtt_connected:
     st.error("""
     ⚠️ **MQTT TIDAK TERKONEKSI!** 
     
-    Silakan klik tombol "Sambungkan" di sidebar untuk menghubungkan ke broker MQTT.
+    Silakan klik tombol "Sambungkan ke MQTT" di sidebar untuk menghubungkan ke broker.
     
     **Pastikan:**
     1. ESP32 menyala dan terhubung ke WiFi
@@ -449,7 +320,10 @@ if not st.session_state.mqtt_connected:
     3. Format data: `{timestamp;intensity;voltage}`
     """)
 else:
-    st.success("✅ **TERHUBUNG KE MQTT BROKER** - Menunggu data dari ESP32...")
+    if st.session_state.last_data:
+        st.success(f"✅ **TERHUBUNG KE MQTT BROKER** - Data terakhir: {st.session_state.last_data.get('timestamp').strftime('%H:%M:%S')}")
+    else:
+        st.success("✅ **TERHUBUNG KE MQTT BROKER** - Menunggu data dari ESP32...")
 
 # ==================== METRICS CARDS ====================
 st.header("📊 STATUS REAL-TIME")
@@ -462,21 +336,29 @@ if st.session_state.last_data:
     with col1:
         intensity = data.get("intensity")
         if intensity is not None:
+            # Determine status based on intensity
             if intensity < 30:
                 color = "🟢"
                 status_text = "GELAP"
+                status_color = "normal"
+                intensity_desc = "Lampu MENYALA"
             elif intensity < 70:
                 color = "🟡"
                 status_text = "SEDANG"
+                status_color = "off"
+                intensity_desc = "Kondisi Normal"
             else:
                 color = "🔵"
                 status_text = "TERANG"
+                status_color = "inverse"
+                intensity_desc = "Lampu MATI"
             
             st.metric(
                 label=f"{color} Intensitas Cahaya",
                 value=f"{intensity:.1f}%",
-                delta=status_text,
-                delta_color="off"
+                delta=f"{status_text}",
+                delta_color=status_color,
+                help=intensity_desc
             )
         else:
             st.metric("Intensitas Cahaya", "N/A")
@@ -488,17 +370,24 @@ if st.session_state.last_data:
         if relay_state == "AKTIF":
             icon = "🔴"
             bg_color = "#dc3545"
-        else:
+            status_desc = "Tegangan 220V - Relay ON"
+        elif relay_state == "MATI":
             icon = "🟢"
             bg_color = "#28a745"
+            status_desc = "Tegangan 0V - Relay OFF"
+        else:
+            icon = "❓"
+            bg_color = "#6c757d"
+            status_desc = "Status tidak diketahui"
         
         st.markdown(f"""
         <div style="background-color: {bg_color}; padding: 15px; border-radius: 10px; color: white; text-align: center;">
-            <div style="font-size: 14px;">{icon} Status Relay</div>
+            <div style="font-size: 14px; opacity: 0.9;">{icon} Status Relay</div>
             <div style="font-size: 24px; font-weight: bold; margin: 5px 0;">{relay_state}</div>
-            <div style="font-size: 16px;">{voltage:.1f} V</div>
+            <div style="font-size: 16px;">{voltage if voltage is not None else 'N/A'} V</div>
         </div>
         """, unsafe_allow_html=True)
+        st.caption(status_desc)
     
     with col3:
         lamp_state = data.get("lamp_state", "UNKNOWN")
@@ -507,18 +396,26 @@ if st.session_state.last_data:
             icon = "💡"
             bg_color = "#FFD700"
             text_color = "black"
-        else:
+            lamp_desc = "Lampu sedang menyala"
+        elif lamp_state == "MATI":
             icon = "🌙"
             bg_color = "#2E4053"
             text_color = "white"
+            lamp_desc = "Lampu mati"
+        else:
+            icon = "❓"
+            bg_color = "#6c757d"
+            text_color = "white"
+            lamp_desc = "Status tidak diketahui"
         
         st.markdown(f"""
         <div style="background-color: {bg_color}; padding: 15px; border-radius: 10px; color: {text_color}; text-align: center;">
-            <div style="font-size: 14px;">Status Lampu</div>
+            <div style="font-size: 14px; opacity: 0.9;">Status Lampu</div>
             <div style="font-size: 36px; margin: 10px 0;">{icon}</div>
             <div style="font-size: 20px; font-weight: bold;">{lamp_state}</div>
         </div>
         """, unsafe_allow_html=True)
+        st.caption(lamp_desc)
     
     with col4:
         timestamp = data.get("timestamp")
@@ -529,21 +426,103 @@ if st.session_state.last_data:
             time_str = "N/A"
             date_str = "N/A"
         
+        data_count = len(st.session_state.logs)
+        
         st.markdown(f"""
         <div style="background-color: #0d6efd; padding: 15px; border-radius: 10px; color: white; text-align: center;">
-            <div style="font-size: 14px;">🕐 Update Terakhir</div>
-            <div style="font-size: 24px; font-weight: bold; margin: 5px 0;">{time_str}</div>
-            <div style="font-size: 14px;">{date_str}</div>
+            <div style="font-size: 14px; opacity: 0.9;">📊 Info Sistem</div>
+            <div style="font-size: 20px; font-weight: bold; margin: 5px 0;">{time_str}</div>
+            <div style="font-size: 12px;">{date_str}</div>
+            <div style="font-size: 12px; margin-top: 5px;">Data: {data_count} records</div>
         </div>
         """, unsafe_allow_html=True)
+        st.caption("Update terakhir")
 else:
-    st.info("📭 **Belum ada data** - Tunggu data dari ESP32 atau pastikan MQTT terhubung")
+    st.info("📭 **Belum ada data** - Tunggu data dari ESP32 atau sambungkan ke MQTT terlebih dahulu")
+
+# ==================== FUNGSI UTILITAS ====================
+def calculate_statistics():
+    """Calculate statistics from logs"""
+    if not st.session_state.logs:
+        return {
+            "avg_intensity": 0,
+            "avg_voltage": 0,
+            "lamp_on_percentage": 0,
+            "total_data": 0,
+            "latest_timestamp": "N/A"
+        }
+    
+    df = pd.DataFrame(st.session_state.logs)
+    
+    if df.empty:
+        return {
+            "avg_intensity": 0,
+            "avg_voltage": 0,
+            "lamp_on_percentage": 0,
+            "total_data": 0,
+            "latest_timestamp": "N/A"
+        }
+    
+    # Basic stats
+    avg_intensity = df["intensity"].mean() if "intensity" in df.columns and not df["intensity"].isna().all() else 0
+    avg_voltage = df["voltage"].mean() if "voltage" in df.columns and not df["voltage"].isna().all() else 0
+    
+    # Lamp on percentage
+    if "lamp_state" in df.columns:
+        lamp_on_count = (df["lamp_state"] == "MENYALA").sum()
+        lamp_on_percentage = (lamp_on_count / len(df)) * 100 if len(df) > 0 else 0
+    else:
+        lamp_on_percentage = 0
+    
+    # Latest timestamp
+    if "timestamp" in df.columns:
+        latest_timestamp = df["timestamp"].max()
+        if isinstance(latest_timestamp, datetime):
+            latest_timestamp = latest_timestamp.strftime("%H:%M:%S")
+        else:
+            latest_timestamp = "N/A"
+    else:
+        latest_timestamp = "N/A"
+    
+    return {
+        "avg_intensity": round(avg_intensity, 1),
+        "avg_voltage": round(avg_voltage, 1),
+        "lamp_on_percentage": round(lamp_on_percentage, 1),
+        "total_data": len(df),
+        "latest_timestamp": latest_timestamp
+    }
+
+def create_intensity_gauge(value):
+    """Create gauge chart for light intensity"""
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value,
+        title={"text": "INTENSITAS CAHAYA", "font": {"size": 16}},
+        domain={"x": [0, 1], "y": [0, 1]},
+        gauge={
+            "axis": {"range": [0, 100]},
+            "bar": {"color": "#FFA500"},
+            "steps": [
+                {"range": [0, 30], "color": "#4CAF50", "name": "Gelap"},
+                {"range": [30, 70], "color": "#FFC107", "name": "Sedang"},
+                {"range": [70, 100], "color": "#2196F3", "name": "Terang"}
+            ],
+            "threshold": {
+                "line": {"color": "red", "width": 4},
+                "thickness": 0.75,
+                "value": 50
+            }
+        }
+    ))
+    
+    fig.update_layout(height=250, margin=dict(t=50, b=50, l=50, r=50))
+    return fig
 
 # ==================== VISUALISASI DATA ====================
 st.header("📈 VISUALISASI DATA")
 
 if st.session_state.logs:
-    logs_list = st.session_state.logs[-MAX_POINTS:]
+    logs_list = st.session_state.logs[-200:]  # Last 200 points
     df = pd.DataFrame(logs_list)
     
     if not df.empty and "intensity" in df.columns:
@@ -562,26 +541,6 @@ if st.session_state.logs:
                 marker=dict(size=8)
             ))
             
-            # Add voltage as second y-axis if available
-            if "voltage" in df.columns:
-                fig.add_trace(go.Scatter(
-                    x=df["timestamp"],
-                    y=df["voltage"],
-                    mode="lines",
-                    name="Tegangan",
-                    line=dict(color="#0d6efd", width=2, dash="dash"),
-                    yaxis="y2"
-                ))
-                
-                fig.update_layout(
-                    yaxis2=dict(
-                        title="Tegangan (V)",
-                        overlaying="y",
-                        side="right",
-                        showgrid=False
-                    )
-                )
-            
             # Add threshold line
             fig.add_hline(
                 y=50,
@@ -590,6 +549,11 @@ if st.session_state.logs:
                 annotation_text="Threshold (50%)",
                 annotation_position="bottom right"
             )
+            
+            # Color markers by lamp state if available
+            if "lamp_state" in df.columns:
+                colors = df["lamp_state"].apply(lambda x: "#FFD700" if x == "MENYALA" else "#2E4053")
+                fig.update_traces(marker=dict(color=colors))
             
             fig.update_layout(
                 title="TREN INTENSITAS CAHAYA",
@@ -613,59 +577,18 @@ if st.session_state.logs:
             
             st.metric("📊 Rata-rata Intensitas", f"{stats['avg_intensity']}%")
             st.metric("💡 Lampu Menyala", f"{stats['lamp_on_percentage']}%")
+            st.metric("⚡ Tegangan Rata-rata", f"{stats['avg_voltage']}V")
             st.metric("📈 Total Data", f"{stats['total_data']}")
-            st.metric("🕐 Update Terakhir", stats['latest_timestamp'])
     else:
         st.warning("Data tidak lengkap untuk visualisasi")
 else:
     st.info("📭 **Belum ada data untuk divisualisasikan**")
 
-# ==================== KONTROL MANUAL ====================
-st.header("🎛️ KONTROL MANUAL")
-
-if st.session_state.mqtt_connected:
-    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns(3)
-    
-    with col_ctrl1:
-        if st.button("💡 NYALAKAN LAMPU", use_container_width=True, type="primary"):
-            try:
-                pub_client = mqtt.Client()
-                pub_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-                pub_client.publish(MQTT_TOPIC_CONTROL, "LAMP_ON")
-                pub_client.disconnect()
-                st.success("Perintah NYALAKAN LAMPU dikirim")
-            except Exception as e:
-                st.error(f"Gagal mengirim perintah: {e}")
-    
-    with col_ctrl2:
-        if st.button("🌙 MATIKAN LAMPU", use_container_width=True):
-            try:
-                pub_client = mqtt.Client()
-                pub_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-                pub_client.publish(MQTT_TOPIC_CONTROL, "LAMP_OFF")
-                pub_client.disconnect()
-                st.success("Perintah MATIKAN LAMPU dikirim")
-            except Exception as e:
-                st.error(f"Gagal mengirim perintah: {e}")
-    
-    with col_ctrl3:
-        if st.button("🔄 STATUS SYSTEM", use_container_width=True, type="secondary"):
-            try:
-                pub_client = mqtt.Client()
-                pub_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-                pub_client.publish(MQTT_TOPIC_CONTROL, "GET_STATUS")
-                pub_client.disconnect()
-                st.success("Request status dikirim")
-            except Exception as e:
-                st.error(f"Gagal mengirim request: {e}")
-else:
-    st.warning("⚠️ Koneksi MQTT diperlukan untuk kontrol manual")
-
 # ==================== DATA HISTORIS ====================
 st.header("📋 DATA HISTORIS")
 
 if st.session_state.logs:
-    logs_list = st.session_state.logs[-100:]  # Last 100 records
+    logs_list = st.session_state.logs[-50:]  # Last 50 records
     df_display = pd.DataFrame(logs_list)
     
     if not df_display.empty:
@@ -708,18 +631,18 @@ with st.expander("🔍 PANEL DIAGNOSTIK", expanded=False):
     
     with diag_col1:
         st.subheader("🔄 Status Sistem")
-        st.write(f"**MQTT Worker:** {'✅ Berjalan' if st.session_state.mqtt_thread_started else '❌ Berhenti'}")
         st.write(f"**Koneksi MQTT:** {'✅ Terhubung' if st.session_state.mqtt_connected else '❌ Terputus'}")
         st.write(f"**Status:** {st.session_state.connection_status}")
-        st.write(f"**Data dalam queue:** {GLOBAL_MQ.qsize()}")
+        st.write(f"**Client MQTT:** {'✅ Ada' if st.session_state.mqtt_client else '❌ Tidak ada'}")
         st.write(f"**Total data:** {len(st.session_state.logs)}")
+        st.write(f"**Data terakhir:** {st.session_state.last_connection_attempt}")
         
         if st.button("🩺 Refresh Diagnostics", key="refresh_diag"):
             st.rerun()
     
     with diag_col2:
         st.subheader("🌐 Network Test")
-        if st.button("Test Broker Connection", use_container_width=True):
+        if st.button("Test Broker Connection", use_container_width=True, key="test_broker_diag"):
             with st.spinner("Testing broker.hivemq.com..."):
                 success, error = test_broker_connection()
                 if success:
@@ -744,9 +667,6 @@ with footer_col2:
     </div>
     """, unsafe_allow_html=True)
 
-# Process any remaining messages
-process_queue()
-
 # CSS Styling
 st.markdown("""
 <style>
@@ -770,3 +690,7 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# Auto-refresh
+time.sleep(2)
+st.rerun()
